@@ -1,0 +1,11 @@
+# appstore-switch 账号配置
+# 把本文件复制为 accounts.conf 后填写，或直接执行：
+#   ./appstore-switch add <别名> <Apple ID>
+#
+# 格式：别名=Apple ID
+# 别名只能包含字母、数字、点、下划线和短横线。
+# 密码不要写在这个文件里，由 add 命令存进 macOS Keychain。
+
+# cn1=example-cn-1@icloud.com
+# us=example-us@icloud.com
+# tr=example-tr@icloud.com

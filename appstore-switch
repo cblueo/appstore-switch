@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# appstore-switch：用 macOS Keychain 存密码，用 AppleScript 操作本机 App Store 登录弹窗切换账号。
+#
+# 给后续 Agent：菜单、弹窗或冷启动等待变了时，先在本机看真实 UI 和终端日志，验证能填上再改。
+# 不要改 add/list/remove/Keychain；不要先加 Swift 或新依赖；不要用固定 delay 代替轮询。
+# 用户描述可直接用：「App Store 菜单/登录弹窗变了」或「没打开 App Store 时找不到登录入口，按脚本注释先探测再改。」
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ACCOUNTS_FILE="$SCRIPT_DIR/accounts.conf"
+KEYCHAIN_PREFIX="appstore-switch"
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '[appstore-switch] %s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+用法：
+  ./appstore-switch add <别名> <Apple ID>
+  ./appstore-switch list
+  ./appstore-switch remove <别名>
+  ./appstore-switch <别名>
+
+示例：
+  ./appstore-switch add cn1 example-cn-1@icloud.com
+  ./appstore-switch add us example-us@icloud.com
+  ./appstore-switch add tr example-tr@icloud.com
+
+  ./appstore-switch list
+  ./appstore-switch cn1
+  ./appstore-switch us
+  ./appstore-switch tr
+
+配置文件：
+  accounts.conf（与 appstore-switch 脚本同级）
+  格式：别名=Apple ID
+
+密码：
+  保存到 macOS Keychain
+EOF
+}
+
+ensure_config() {
+  if [[ ! -e "$ACCOUNTS_FILE" ]]; then
+    cat > "$ACCOUNTS_FILE" <<'EOF'
+# appstore-switch 账号配置
+# 格式：别名=Apple ID
+EOF
+  fi
+  chmod 600 "$ACCOUNTS_FILE"
+}
+
+valid_alias() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+lookup_apple_id() {
+  local alias="$1"
+
+  awk -F '=' -v wanted="$alias" '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      key=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+
+      if (key == wanted) {
+        sub(/^[^=]*=/, "", $0)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+        print
+        exit
+      }
+    }
+  ' "$ACCOUNTS_FILE"
+}
+
+save_account() {
+  local alias="$1"
+  local apple_id="$2"
+  local tmp
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/appstore-switch.XXXXXX")"
+
+  awk -F '=' -v wanted="$alias" '
+    /^[[:space:]]*#/ { print; next }
+    /^[[:space:]]*$/ { print; next }
+    {
+      key=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key != wanted) print
+    }
+  ' "$ACCOUNTS_FILE" > "$tmp"
+
+  printf '%s=%s\n' "$alias" "$apple_id" >> "$tmp"
+
+  mv "$tmp" "$ACCOUNTS_FILE"
+  chmod 600 "$ACCOUNTS_FILE"
+}
+
+remove_account_record() {
+  local alias="$1"
+  local tmp
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/appstore-switch.XXXXXX")"
+
+  awk -F '=' -v wanted="$alias" '
+    /^[[:space:]]*#/ { print; next }
+    /^[[:space:]]*$/ { print; next }
+    {
+      key=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key != wanted) print
+    }
+  ' "$ACCOUNTS_FILE" > "$tmp"
+
+  mv "$tmp" "$ACCOUNTS_FILE"
+  chmod 600 "$ACCOUNTS_FILE"
+}
+
+keychain_service() {
+  printf '%s:%s' "$KEYCHAIN_PREFIX" "$1"
+}
+
+add_account() {
+  local alias="${1:-}"
+  local apple_id="${2:-}"
+
+  [[ -n "$alias" && -n "$apple_id" ]] \
+    || die "用法：./appstore-switch add <别名> <Apple ID>"
+
+  valid_alias "$alias" \
+    || die "别名只能包含字母、数字、点、下划线和短横线。"
+
+  [[ "$apple_id" != *$'\n'* && "$apple_id" != *$'\r'* && "$apple_id" != *"="* ]] \
+    || die "Apple ID 格式无效。"
+
+  local password confirm service
+  service="$(keychain_service "$alias")"
+
+  printf 'Apple ID: %s\n' "$apple_id"
+
+  read -r -s -p "密码: " password
+  printf '\n'
+
+  read -r -s -p "再次输入密码: " confirm
+  printf '\n'
+
+  [[ -n "$password" ]] || die "密码不能为空。"
+  [[ "$password" == "$confirm" ]] || die "两次输入的密码不一致。"
+
+  /usr/bin/security add-generic-password \
+    -a "$apple_id" \
+    -s "$service" \
+    -l "$service" \
+    -w "$password" \
+    -U >/dev/null
+
+  unset password confirm
+
+  save_account "$alias" "$apple_id"
+
+  log "已保存账号：$alias -> $apple_id"
+  printf '配置文件：%s\n' "$ACCOUNTS_FILE"
+}
+
+list_accounts() {
+  local found=0
+
+  printf '%-16s %s\n' "别名" "Apple ID"
+  printf '%-16s %s\n' "----------------" "--------------------------------"
+
+  while IFS='=' read -r alias apple_id; do
+    [[ -z "${alias//[[:space:]]/}" ]] && continue
+    [[ "$alias" =~ ^[[:space:]]*# ]] && continue
+
+    alias="${alias#"${alias%%[![:space:]]*}"}"
+    alias="${alias%"${alias##*[![:space:]]}"}"
+
+    apple_id="${apple_id#"${apple_id%%[![:space:]]*}"}"
+    apple_id="${apple_id%"${apple_id##*[![:space:]]}"}"
+
+    [[ -z "$alias" || -z "$apple_id" ]] && continue
+
+    printf '%-16s %s\n' "$alias" "$apple_id"
+    found=1
+  done < "$ACCOUNTS_FILE"
+
+  if [[ "$found" -eq 0 ]]; then
+    printf '(还没有配置账号)\n'
+  fi
+}
+
+remove_account() {
+  local alias="${1:-}"
+
+  [[ -n "$alias" ]] \
+    || die "用法：./appstore-switch remove <别名>"
+
+  local apple_id
+  apple_id="$(lookup_apple_id "$alias")"
+
+  [[ -n "$apple_id" ]] \
+    || die "没有找到别名：$alias"
+
+  /usr/bin/security delete-generic-password \
+    -s "$(keychain_service "$alias")" >/dev/null 2>&1 || true
+
+  remove_account_record "$alias"
+
+  log "已删除账号：$alias"
+}
+
+read_password() {
+  local alias="$1"
+
+  /usr/bin/security find-generic-password \
+    -s "$(keychain_service "$alias")" \
+    -w
+}
+
+# UI 变了时的排查（先探测、验证，再改下面 AppleScript）：
+# 1. 确认辅助功能已授权给 Terminal / osascript。
+# 2. 用假账号验证，不要读 accounts.conf 真邮箱，也不要从钥匙串取真密码去试登。
+# 3. 列出 Store 菜单（中文环境把 Store 换成 商店）：
+#      osascript -e 'tell application "App Store" to activate' -e 'delay 1' \
+#        -e 'tell application "System Events" to tell process "App Store" to get name of every menu item of menu 1 of menu bar item "Store" of menu bar 1'
+#    把实际「登录 / 退出登录」文案写回 signInItems、signOutItems、storeMenuNames。
+# 4. 点 Store → Sign In 打开弹窗后，核路径（文章方案是 sheet 1 of sheet 1 of window 1）：
+#      osascript -e 'tell application "System Events" to tell process "App Store" to tell sheet 1 of sheet 1 of window 1 to return (count of text fields) & " " & (count of buttons)'
+#    路径报错就改 loginSheet；fields 不是 1（账号页）或 2（密码页）就改 text field 序号。
+# 5. 用占位邮箱测：填 text field 1 → return → 应出现 2 个 text field；密码在 field 1，账号在 field 2。
+# 6. 抽出 AppleScript 用 osascript 编译/试跑，确认无 -2741；冷启动验证要先完全退出 App Store（Command+Q）再跑 ./appstore-switch <别名>。
+# 7. 就绪条件是轮询 UI，不是固定 delay：Store 菜单出现登录/退出项（约 30 秒）→ window 1（约 30 秒）→ sheet 1 of sheet 1 且有 text field 1（约 10 秒）。
+# 8. 终端日志前缀 [appstore-switch]。报「没有找到登录入口」先看菜单是否就绪；报「还没加载完成/窗口还没出现/弹窗还没出现」再调对应 wait 次数，不要盲目加 delay。
+switch_account() {
+  local alias="$1"
+  local apple_id password
+
+  apple_id="$(lookup_apple_id "$alias")"
+
+  [[ -n "$apple_id" ]] \
+    || die "没有找到别名：$alias。先执行：./appstore-switch add $alias <Apple ID>"
+
+  if ! password="$(read_password "$alias" 2>/dev/null)"; then
+    die "Keychain 中找不到 $alias 的密码，请重新执行 add。"
+  fi
+
+  log "开始切换：别名=$alias Apple ID=$apple_id"
+  log "已从 Keychain 读取密码"
+
+  APPSTORE_ACCOUNT="$apple_id" \
+  APPSTORE_PASSWORD="$password" \
+  /usr/bin/osascript <<'APPLESCRIPT'
+set accountName to system attribute "APPSTORE_ACCOUNT"
+set accountPassword to system attribute "APPSTORE_PASSWORD"
+
+-- 与菜单栏实际文案保持一致；变了只改这三组，不要扫 entire contents。
+set signInItems to {"Sign In", "登录…", "登录...", "登录"}
+set signOutItems to {"Sign Out", "退出登录", "退出"}
+set storeMenuNames to {"Store", "商店"}
+
+on logMessage(msg)
+	do shell script "printf %s " & quoted form of ("[appstore-switch] " & msg) & " 1>&2"
+end logMessage
+
+on clickStoreMenuItem(menuNames, itemNames)
+	repeat with menuName in menuNames
+		try
+			repeat with itemName in itemNames
+				try
+					tell application "System Events"
+						tell process "App Store"
+							click menu item (contents of itemName) of menu 1 of menu bar item (contents of menuName) of menu bar 1
+						end tell
+					end tell
+					my logMessage("已点击菜单：" & (contents of menuName) & " -> " & (contents of itemName))
+					return true
+				end try
+			end repeat
+		end try
+	end repeat
+	return false
+end clickStoreMenuItem
+
+on appStoreMenuReady(menuNames, signInItems, signOutItems)
+	tell application "System Events"
+		tell process "App Store"
+			if not (exists menu bar 1) then return false
+
+			repeat with menuName in menuNames
+				if exists menu bar item (contents of menuName) of menu bar 1 then
+					tell menu 1 of menu bar item (contents of menuName) of menu bar 1
+						repeat with itemName in signInItems
+							if exists menu item (contents of itemName) then return true
+						end repeat
+						repeat with itemName in signOutItems
+							if exists menu item (contents of itemName) then return true
+						end repeat
+					end tell
+				end if
+			end repeat
+		end tell
+	end tell
+
+	return false
+end appStoreMenuReady
+
+on waitForAppStoreReady(menuNames, signInItems, signOutItems)
+	my logMessage("正在启动 App Store，等待 Store 菜单出现（最多约 30 秒）...")
+
+	repeat with attempt from 1 to 60
+		tell application "System Events"
+			if exists process "App Store" then
+				if my appStoreMenuReady(menuNames, signInItems, signOutItems) then
+					my logMessage("Store 菜单已就绪（第 " & attempt & " 次检查）")
+					return true
+				end if
+			end if
+		end tell
+
+		if attempt is in {1, 5, 10, 20, 40, 60} then
+			my logMessage("仍在等待 Store 菜单...（第 " & attempt & "/60 次）")
+		end if
+
+		delay 0.5
+	end repeat
+
+	return false
+end waitForAppStoreReady
+
+on waitForAppStoreWindow()
+	my logMessage("等待 App Store 主窗口出现（最多约 30 秒）...")
+
+	repeat with attempt from 1 to 60
+		try
+			tell application "System Events"
+				tell process "App Store"
+					if exists window 1 then
+						my logMessage("主窗口已出现（第 " & attempt & " 次检查）")
+						return window 1
+					end if
+				end tell
+			end tell
+		end try
+
+		if attempt is in {1, 5, 10, 20, 40, 60} then
+			my logMessage("仍在等待主窗口...（第 " & attempt & "/60 次）")
+		end if
+
+		delay 0.5
+	end repeat
+
+	return missing value
+end waitForAppStoreWindow
+
+on waitForLoginSheet(appStoreWindow)
+	my logMessage("等待登录弹窗出现（最多约 10 秒）...")
+
+	repeat with attempt from 1 to 40
+		try
+			tell application "System Events"
+				tell process "App Store"
+					if exists sheet 1 of sheet 1 of appStoreWindow then
+						if exists text field 1 of sheet 1 of sheet 1 of appStoreWindow then
+							my logMessage("登录弹窗已出现（第 " & attempt & " 次检查）")
+							return sheet 1 of sheet 1 of appStoreWindow
+						end if
+					end if
+				end tell
+			end tell
+		end try
+
+		if attempt is in {1, 5, 10, 20, 40} then
+			my logMessage("仍在等待登录弹窗...（第 " & attempt & "/40 次）")
+		end if
+
+		delay 0.25
+	end repeat
+
+	return missing value
+end waitForLoginSheet
+
+my logMessage("激活 App Store")
+
+tell application "App Store"
+	activate
+end tell
+
+if not my waitForAppStoreReady(storeMenuNames, signInItems, signOutItems) then
+	error "App Store 还没加载完成，请稍后重试。"
+end if
+
+tell application "System Events"
+	if not (exists process "App Store") then error "App Store 没有启动"
+
+	tell process "App Store"
+		set frontmost to true
+
+		set appStoreWindow to my waitForAppStoreWindow()
+		if appStoreWindow is missing value then error "App Store 窗口还没出现，请稍后重试。"
+
+		my logMessage("尝试打开登录入口")
+		set openedSignIn to my clickStoreMenuItem(storeMenuNames, signInItems)
+
+		if not openedSignIn then
+			my logMessage("当前可能已登录，先尝试退出登录")
+			my clickStoreMenuItem(storeMenuNames, signOutItems)
+			delay 2
+			my logMessage("退出后再次尝试打开登录入口")
+			set openedSignIn to my clickStoreMenuItem(storeMenuNames, signInItems)
+		end if
+
+		if not openedSignIn then error "没有找到 App Store 的登录入口。"
+
+		set loginSheet to my waitForLoginSheet(appStoreWindow)
+		if loginSheet is missing value then error "登录弹窗还没出现，请稍后重试。"
+
+		my logMessage("填写 Apple ID")
+		set value of text field 1 of loginSheet to accountName
+		keystroke return
+		delay 2
+
+		my logMessage("填写密码并提交")
+		-- 回车后：text field 1 = 密码，text field 2 = 账号（若仍只有 1 个框，下面 try 会跳过）。
+		try
+			set value of text field 2 of loginSheet to accountName
+		end try
+		set value of text field 1 of loginSheet to accountPassword
+		keystroke return
+	end tell
+end tell
+
+my logMessage("登录信息已提交")
+return "OK"
+APPLESCRIPT
+
+  unset password
+
+  log "切换流程已完成。若 Apple 要求双重认证，请手动输入验证码。"
+}
+
+main() {
+  ensure_config
+
+  case "${1:-}" in
+    "")
+      usage
+      ;;
+
+    -h|--help|help)
+      usage
+      ;;
+
+    add)
+      shift
+      add_account "${1:-}" "${2:-}"
+      ;;
+
+    list)
+      list_accounts
+      ;;
+
+    remove|rm)
+      shift
+      remove_account "${1:-}"
+      ;;
+
+    *)
+      switch_account "$1"
+      ;;
+  esac
+}
+
+main "$@"
