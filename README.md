@@ -98,6 +98,10 @@ chmod +x appstore-switch
 
 登录弹窗的填写路径参考了 [tobemaster 用 AppleScript 切换 App Store 账号](https://gist.github.com/tobemaster56/15ee009cca6de05c10ff7fae0592c3cb) 的做法。
 
+## Friends / 友情链接
+
+- [LINUX DO](https://linux.do)
+
 ## License
 
 [MIT](LICENSE)
